@@ -95,6 +95,7 @@ export default {
     groupMonitoring: 'Monitoring',
     groupTools: 'Tools',
     settings: 'Settings',
+    databaseConfig: 'Database Config',
     connected: 'Connected',
     disconnected: 'Disconnected',
     collapse: 'Collapse menu',

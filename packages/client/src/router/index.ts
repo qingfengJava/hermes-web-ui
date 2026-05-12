@@ -95,6 +95,11 @@ const router = createRouter({
       name: 'hermes.files',
       component: () => import('@/views/hermes/FilesView.vue'),
     },
+    {
+      path: '/hermes/config-db',
+      name: 'hermes.configDb',
+      component: () => import('@/views/hermes/ConfigDbView.vue'),
+    },
   ],
 })
 

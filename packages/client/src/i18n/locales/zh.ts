@@ -95,6 +95,7 @@ export default {
     groupMonitoring: '监控',
     groupTools: '工具',
     settings: '设置',
+    databaseConfig: '数据库配置',
     connected: '已连接',
     disconnected: '未连接',
     collapse: '收起菜单',

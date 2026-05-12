@@ -28,6 +28,7 @@ import { jobRoutes } from './hermes/jobs'
 import { cronHistoryRoutes } from './hermes/cron-history'
 import { kanbanRoutes } from './hermes/kanban'
 import { ttsRoutes } from './hermes/tts'
+import { configDbRoutes } from './hermes/config-db'
 import { proxyRoutes, proxyMiddleware } from './hermes/proxy'
 import { groupChatRoutes, setGroupChatServer } from './hermes/group-chat'
 
@@ -58,6 +59,7 @@ export function registerRoutes(app: any, requireAuth: (ctx: Context, next: Next)
   app.use(modelRoutes.routes())
   app.use(providerRoutes.routes())
   app.use(configRoutes.routes())
+  app.use(configDbRoutes.routes())          // 数据库配置管理 API
   app.use(logRoutes.routes())
   app.use(codexAuthRoutes.routes())
   app.use(nousAuthRoutes.routes())

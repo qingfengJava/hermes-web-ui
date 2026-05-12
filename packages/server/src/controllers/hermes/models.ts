@@ -7,6 +7,7 @@ import { getCopilotModelsDetailed, resolveCopilotOAuthToken, type CopilotModelMe
 import { readAppConfig, writeAppConfig, type ModelVisibilityRule } from '../../services/app-config'
 import { getDb } from '../../db'
 import { MODEL_CONTEXT_TABLE } from '../../db/hermes/schemas'
+import { callConfigApi } from '../../services/hermes/config-db'
 
 const PROVIDER_MODEL_CATALOG = buildProviderModelMap()
 
@@ -302,6 +303,83 @@ export async function getAvailable(ctx: any) {
     const visibleGroups = applyModelVisibility(groupsWithAliases, modelVisibility)
     const visibleDefault = resolveVisibleDefault(currentDefault, currentDefaultProvider, visibleGroups)
 
+    // 从数据库加载额外的 provider 配置（DB 优先于 YAML）
+    try {
+      const dbProviderResult = await callConfigApi({
+        action: 'list',
+        table: 'provider_configs',
+        profile: 'default',
+      })
+      const dbModelResult = await callConfigApi({
+        action: 'list',
+        table: 'model_configs',
+        profile: 'default',
+      })
+
+      if (dbProviderResult.success && dbProviderResult.data) {
+        const dbProviders = dbProviderResult.data.filter((p: any) => p.enabled)
+        const dbModels = dbModelResult.success ? (dbModelResult.data || []) : []
+        const dbDefaultModel = dbModels.find((m: any) => m.is_default && m.enabled)
+
+        // DB 中的默认模型优先
+        if (dbDefaultModel) {
+          currentDefault = dbDefaultModel.model_name
+          currentDefaultProvider = dbDefaultModel.provider_key
+        }
+
+        for (const dbProvider of dbProviders) {
+          const providerKey = dbProvider.provider_key
+          // 跳过已经在 groups 中的内置供应商（已通过 env var 匹配的）
+          const existingGroup = groups.find(g => g.provider === providerKey)
+          if (existingGroup) {
+            // 用 DB 中的元数据更新已有的 group
+            if (dbProvider.base_url && !existingGroup.base_url) {
+              existingGroup.base_url = dbProvider.base_url
+            }
+            continue
+          }
+
+          // 新建 group（来自 DB 的自定义供应商）
+          const preset = PROVIDER_PRESETS.find((p: any) => p.value === providerKey)
+          const bareKey = providerKey.replace('custom:', '')
+          const barePreset = PROVIDER_PRESETS.find((p: any) => p.value === bareKey)
+
+          const label = preset?.label || barePreset?.label || dbProvider.display_name || providerKey
+          const baseUrl = preset?.base_url || barePreset?.base_url || dbProvider.base_url || ''
+
+          // 从 model_catalog 获取模型列表
+          let modelsList: string[] = []
+          if (preset || barePreset) {
+            const catalogModels = PROVIDER_MODEL_CATALOG[providerKey] || PROVIDER_MODEL_CATALOG[bareKey]
+            if (catalogModels && catalogModels.length > 0) {
+              modelsList = [...catalogModels]
+            }
+          }
+          // 从 DB model_configs 补充模型
+          const providerModels = dbModels.filter((m: any) => m.provider_key === providerKey && m.enabled)
+          for (const pm of providerModels) {
+            if (pm.model_name && !modelsList.includes(pm.model_name)) {
+              modelsList.push(pm.model_name)
+            }
+          }
+
+          if (modelsList.length > 0) {
+            groups.push({
+              provider: providerKey,
+              label,
+              base_url: baseUrl,
+              models: modelsList,
+              api_key: '',
+              builtin: !!(preset || barePreset),
+            })
+          }
+        }
+      }
+    } catch (dbErr: any) {
+      // DB 查询失败不阻塞请求
+      console.error('Failed to load providers from DB:', dbErr.message)
+    }
+
     // 动态拉一次 copilot 模型用于 allProviders 展示（同一请求复用缓存）
     // 未启用 Copilot 时跳过拉取，避免空跑网络请求。
     const liveCopilotModels = copilotEnabled ? await getCopilotLive() : []
@@ -407,8 +485,33 @@ export async function setModelAlias(ctx: any) {
 
 export async function getConfigModels(ctx: any) {
   try {
-    const config = await readConfigYaml()
-    ctx.body = buildModelGroups(config)
+    // 从 DB 读取配置的 providers 和 models
+    const [providerResult, modelResult] = await Promise.all([
+      callConfigApi({ action: 'list', table: 'provider_configs', profile: 'default' }),
+      callConfigApi({ action: 'list', table: 'model_configs', profile: 'default' }),
+    ])
+
+    const providers = providerResult.success ? (providerResult.data || []) : []
+    const models = modelResult.success ? (modelResult.data || []) : []
+
+    // 查找默认模型
+    const defaultModel = models.find((m: any) => m.is_default && m.enabled)
+
+    ctx.body = {
+      default: defaultModel?.model_name || '',
+      default_provider: defaultModel?.provider_key || '',
+      groups: providers
+        .filter((p: any) => p.enabled)
+        .map((p: any) => ({
+          provider: p.provider_key,
+          label: p.display_name || p.provider_key,
+          base_url: p.base_url || '',
+          models: models
+            .filter((m: any) => m.provider_key === p.provider_key && m.enabled)
+            .map((m: any) => m.model_name),
+          api_key: '',
+        })),
+    }
   } catch (err: any) {
     ctx.status = 500
     ctx.body = { error: err.message }
@@ -423,11 +526,52 @@ export async function setConfigModel(ctx: any) {
     return
   }
   try {
-    const config = await readConfigYaml()
-    config.model = {}
-    config.model.default = defaultModel
-    if (reqProvider) { config.model.provider = reqProvider }
-    await writeConfigYaml(config)
+    // 查询当前 model_configs 中所有记录
+    const listResult = await callConfigApi({
+      action: 'list',
+      table: 'model_configs',
+      profile: 'default',
+    })
+
+    // 清除所有现有默认标记
+    if (listResult.success && listResult.data) {
+      for (const row of listResult.data) {
+        if (row.is_default) {
+          await callConfigApi({
+            action: 'update',
+            table: 'model_configs',
+            data: { id: row.id, is_default: false },
+          })
+        }
+      }
+    }
+
+    // 查找或创建该 provider+model 的记录
+    const providerKey = reqProvider || ''
+    const existing = listResult.data?.find(
+      (r: any) => r.provider_key === providerKey && r.model_name === defaultModel
+    )
+
+    if (existing) {
+      await callConfigApi({
+        action: 'update',
+        table: 'model_configs',
+        data: { id: existing.id, is_default: true, enabled: true },
+      })
+    } else {
+      await callConfigApi({
+        action: 'create',
+        table: 'model_configs',
+        profile: 'default',
+        data: {
+          model_name: defaultModel,
+          provider_key: providerKey,
+          is_default: true,
+          enabled: true,
+        },
+      })
+    }
+
     ctx.body = { success: true }
   } catch (err: any) {
     ctx.status = 500
