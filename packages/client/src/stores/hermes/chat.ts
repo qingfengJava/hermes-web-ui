@@ -1,5 +1,5 @@
-import { startRunViaSocket, resumeSession, registerSessionHandlers, unregisterSessionHandlers, getChatRunSocket, type RunEvent, type ContentBlock as ContentBlockImport } from '@/api/hermes/chat'
-import { deleteSession as deleteSessionApi, fetchSession, fetchSessions, type HermesMessage, type SessionSummary } from '@/api/hermes/sessions'
+import { startRunViaSocket, resumeSession, registerSessionHandlers, unregisterSessionHandlers, getChatRunSocket, respondToolApproval, type RunEvent, type ContentBlock as ContentBlockImport } from '@/api/hermes/chat'
+import { deleteSession as deleteSessionApi, fetchSession, fetchSessions, setSessionModel, type HermesMessage, type SessionSummary } from '@/api/hermes/sessions'
 import { getApiKey } from '@/api/client'
 import { defineStore } from 'pinia'
 import { ref, computed } from 'vue'
@@ -23,7 +23,7 @@ export interface Attachment {
 
 export interface Message {
   id: string
-  role: 'user' | 'assistant' | 'system' | 'tool'
+  role: 'user' | 'assistant' | 'system' | 'tool' | 'command'
   content: string
   timestamp: number
   toolName?: string
@@ -41,10 +41,24 @@ export interface Message {
   // 不含 <think> 包裹标签；内容自身可以为多段纯文本。
   reasoning?: string
   queued?: boolean
+  systemType?: 'command' | 'error'
+  commandAction?: string
+  commandData?: Record<string, unknown>
+}
+
+export interface PendingApproval {
+  sessionId: string
+  approvalId: string
+  command: string
+  description: string
+  choices: Array<'once' | 'session' | 'always' | 'deny'>
+  allowPermanent: boolean
+  requestedAt: number
 }
 
 export interface Session {
   id: string
+  profile?: string
   title: string
   source?: string
   messages: Message[]
@@ -55,6 +69,7 @@ export interface Session {
   messageCount?: number
   inputTokens?: number
   outputTokens?: number
+  contextTokens?: number
   endedAt?: number | null
   lastActiveAt?: number
   workspace?: string | null
@@ -62,6 +77,21 @@ export interface Session {
 
 function uid(): string {
   return Date.now().toString(36) + Math.random().toString(36).slice(2, 8)
+}
+
+function isToolOutputError(output: unknown): boolean {
+  if (typeof output !== 'string' || !output.trim()) return false
+  try {
+    const parsed = JSON.parse(output)
+    if (parsed && typeof parsed === 'object') {
+      const record = parsed as Record<string, unknown>
+      if (record.success === false) return true
+      if (record.error != null && String(record.error).trim() !== '') return true
+    }
+  } catch {
+    return false
+  }
+  return false
 }
 
 async function uploadFiles(attachments: Attachment[]): Promise<{ name: string; path: string }[]> {
@@ -123,10 +153,11 @@ async function buildContentBlocks(
 }
 
 function mapHermesMessages(msgs: HermesMessage[]): Message[] {
-  // Filter out assistant messages with empty content
+  // Filter out assistant messages with no display content unless they carry tool call metadata
+  // needed to name later tool result rows when resuming persisted history.
   const filteredMsgs = msgs.filter(m => {
     if (m.role === 'assistant') {
-      return m.content && m.content.trim() !== ''
+      return (m.tool_calls?.length || 0) > 0 || (m.content && m.content.trim() !== '')
     }
     return true
   })
@@ -156,7 +187,7 @@ function mapHermesMessages(msgs: HermesMessage[]): Message[] {
           role: 'tool',
           content: '',
           timestamp: Math.round(msg.timestamp * 1000),
-          toolName: tc.function?.name || 'tool',
+          toolName: tc.function?.name || undefined,
           toolCallId: tc.id,
           toolArgs: tc.function?.arguments || undefined,
           toolStatus: 'done',
@@ -168,7 +199,7 @@ function mapHermesMessages(msgs: HermesMessage[]): Message[] {
     // Tool result messages
     if (msg.role === 'tool') {
       const tcId = msg.tool_call_id || ''
-      const toolName = msg.tool_name || toolNameMap.get(tcId) || 'tool'
+      const toolName = msg.tool_name || toolNameMap.get(tcId) || undefined
       const toolArgs = toolArgsMap.get(tcId) || undefined
       // Extract a short preview from the content
       let preview = ''
@@ -202,13 +233,14 @@ function mapHermesMessages(msgs: HermesMessage[]): Message[] {
       continue
     }
 
-    // Normal user/assistant messages
+    // Normal user/assistant/command messages
     result.push({
       id: String(msg.id),
       role: msg.role,
       content: msg.content || '',
       timestamp: Math.round(msg.timestamp * 1000),
       reasoning: msg.reasoning ? msg.reasoning : undefined,
+      systemType: msg.role === 'command' ? 'command' : undefined,
     })
   }
   return result
@@ -217,13 +249,14 @@ function mapHermesMessages(msgs: HermesMessage[]): Message[] {
 function mapHermesSession(s: SessionSummary): Session {
   return {
     id: s.id,
+    profile: s.profile || 'default',
     title: s.title || '',
     source: s.source || undefined,
     messages: [],
     createdAt: Math.round(s.started_at * 1000),
     updatedAt: Math.round((s.last_active || s.ended_at || s.started_at) * 1000),
     model: s.model,
-    provider: (s as any).billing_provider || '',
+    provider: s.provider || (s as any).billing_provider || '',
     messageCount: s.message_count,
     endedAt: s.ended_at != null ? Math.round(s.ended_at * 1000) : null,
     lastActiveAt: s.last_active != null ? Math.round(s.last_active * 1000) : undefined,
@@ -316,10 +349,16 @@ export const useChatStore = defineStore('chat', () => {
   const streamStates = ref<Map<string, { abort: () => void }>>(new Map())
   /** sessionId → server-reported isWorking status */
   const serverWorking = ref<Set<string>>(new Set())
+  const sessionProfileFilter = ref<string | null>(null)
   /** sessionId → queued message count */
   const queueLengths = ref<Map<string, number>>(new Map())
   /** sessionId → queued user messages not yet visible in the transcript */
   const queuedUserMessages = ref<Map<string, Message[]>>(new Map())
+  const pendingApprovals = ref<Map<string, PendingApproval>>(new Map())
+  const activePendingApproval = computed(() => {
+    const sid = activeSessionId.value
+    return sid ? pendingApprovals.value.get(sid) || null : null
+  })
 
   // 自动播放语音开关
   const autoPlaySpeechEnabled = ref(false)
@@ -369,10 +408,19 @@ export const useChatStore = defineStore('chat', () => {
     return streamStates.value.has(sessionId) || serverWorking.value.has(sessionId)
   }
 
-  async function loadSessions() {
+  function clearActiveSession() {
+    activeSessionId.value = null
+    activeSession.value = null
+    focusMessageId.value = null
+    setAbortState(null)
+    setCompressionState(null)
+    removeItem(storageKey())
+  }
+
+  async function loadSessions(profile?: string | null) {
     isLoadingSessions.value = true
     try {
-      const list = await fetchSessions()
+      const list = await fetchSessions(undefined, undefined, profile || undefined)
       const fresh = list.map(mapHermesSession)
       // Preserve already-loaded messages for sessions that are still present,
       // so we don't blow away the active session's messages on refresh.
@@ -390,6 +438,8 @@ export const useChatStore = defineStore('chat', () => {
         : sessions.value[0]?.id
       if (targetId) {
         await switchSession(targetId)
+      } else {
+        clearActiveSession()
       }
     } catch (err) {
       console.error('Failed to load sessions:', err)
@@ -419,11 +469,38 @@ export const useChatStore = defineStore('chat', () => {
   }
 
 
-  function createSession(): Session {
+  function createSession(options: { profile?: string; model?: string; provider?: string } = {}): Session {
     const session: Session = {
       id: uid(),
+      profile: options.profile || useProfilesStore().activeProfileName || 'default',
       title: '',
-      source: 'api_server',
+      source: 'cli',
+      messages: [],
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      model: options.model || undefined,
+      provider: options.provider || '',
+    }
+    sessions.value.unshift(session)
+    return session
+  }
+
+  function newCliSession(): Session {
+    const now = new Date()
+    const ts = [
+      now.getFullYear(),
+      String(now.getMonth() + 1).padStart(2, '0'),
+      String(now.getDate()).padStart(2, '0'),
+      '_',
+      String(now.getHours()).padStart(2, '0'),
+      String(now.getMinutes()).padStart(2, '0'),
+      String(now.getSeconds()).padStart(2, '0'),
+    ].join('')
+    const hex = Math.random().toString(16).slice(2, 8)
+    const session: Session = {
+      id: `${ts}_${hex}`,
+      title: '',
+      source: 'cli',
       messages: [],
       createdAt: Date.now(),
       updatedAt: Date.now(),
@@ -468,6 +545,7 @@ export const useChatStore = defineStore('chat', () => {
           }
           if (data.inputTokens != null) activeSession.value!.inputTokens = data.inputTokens
           if (data.outputTokens != null) activeSession.value!.outputTokens = data.outputTokens
+          if ((data as any).contextTokens != null) activeSession.value!.contextTokens = (data as any).contextTokens
           if (data.messages?.length) {
             activeSession.value!.messages = mapHermesMessages(data.messages as any[])
           }
@@ -491,18 +569,68 @@ export const useChatStore = defineStore('chat', () => {
                   compressed: null,
                 })
               } else if (e.event === 'compression.completed') {
+                const afterTokens = e.contextTokens || e.afterTokens || 0
                 setCompressionState({
                   compressing: false,
                   messageCount: e.totalMessages || 0,
                   beforeTokens: e.beforeTokens || 0,
-                  afterTokens: e.afterTokens || 0,
+                  afterTokens,
                   compressed: e.compressed ?? false,
                   error: e.error,
                 })
+                if (e.contextTokens != null) activeSession.value!.contextTokens = e.contextTokens
               } else if (e.event === 'abort.started') {
                 setAbortState({ aborting: true, synced: null })
               } else if (e.event === 'abort.completed') {
                 setAbortState({ aborting: false, synced: e.synced ?? false })
+              } else if (e.event === 'approval.requested') {
+                setPendingApproval({ ...e, session_id: sessionId } as RunEvent)
+              } else if (e.event === 'approval.resolved') {
+                clearPendingApproval({ ...e, session_id: sessionId } as RunEvent)
+              } else if (e.event === 'run.failed') {
+                addAgentErrorMessage(sessionId, e.error)
+                serverWorking.value.delete(sessionId)
+                queueLengths.value.delete(sessionId)
+              } else if (e.event === 'tool.started') {
+                const msgs = getSessionMsgs(sessionId)
+                const toolCallId = e.tool_call_id as string | undefined
+                const existingTool = toolCallId
+                  ? msgs.find(m => m.role === 'tool' && m.toolCallId === toolCallId)
+                  : null
+                if (existingTool) {
+                  updateMessage(sessionId, existingTool.id, {
+                    toolName: e.tool || e.name,
+                    toolArgs: typeof e.arguments === 'string' ? e.arguments : existingTool.toolArgs,
+                    toolPreview: e.preview || existingTool.toolPreview,
+                    toolStatus: existingTool.toolStatus || 'running',
+                  })
+                } else {
+                  addMessage(sessionId, {
+                    id: uid(),
+                    role: 'tool',
+                    content: '',
+                    timestamp: Date.now(),
+                    toolName: e.tool || e.name,
+                    toolCallId,
+                    toolPreview: e.preview,
+                    toolArgs: typeof e.arguments === 'string' ? e.arguments : undefined,
+                    toolStatus: 'running',
+                  })
+                }
+              } else if (e.event === 'tool.completed') {
+                const msgs = getSessionMsgs(sessionId)
+                const toolCallId = e.tool_call_id as string | undefined
+                const toolMsgs = toolCallId
+                  ? msgs.filter(m => m.role === 'tool' && m.toolCallId === toolCallId)
+                  : msgs.filter(m => m.role === 'tool' && m.toolStatus === 'running')
+                if (toolMsgs.length > 0) {
+                  const output = typeof e.output === 'string' ? e.output : undefined
+                  updateMessage(sessionId, toolMsgs[toolMsgs.length - 1].id, {
+                    toolStatus: e.error === true || isToolOutputError(output) ? 'error' : 'done',
+                    toolDuration: e.duration,
+                    toolResult: output,
+                  })
+                }
               }
             }
           }
@@ -519,23 +647,31 @@ export const useChatStore = defineStore('chat', () => {
     resumeServerWorkingRun(sessionId)
   }
 
-  function newChat() {
-    const session = createSession()
-    // Inherit current global model
+  function newChat(options: { profile?: string; model?: string; provider?: string } = {}) {
     const appStore = useAppStore()
-    session.model = appStore.selectedModel || undefined
+    const session = createSession({
+      profile: options.profile,
+      model: options.model || appStore.selectedModel || undefined,
+      provider: options.provider || appStore.selectedProvider || '',
+    })
     switchSession(session.id)
   }
 
-  async function switchSessionModel(modelId: string, provider?: string) {
-    if (!activeSession.value) return
-    activeSession.value.model = modelId
-    activeSession.value.provider = provider || ''
-    // If provider changed, update global config too (Hermes requires it)
-    if (provider) {
-      const { useAppStore } = await import('./app')
-      await useAppStore().switchModel(modelId, provider)
+  async function switchSessionModel(modelId: string, provider?: string, sessionId?: string): Promise<boolean> {
+    const targetId = sessionId || activeSession.value?.id
+    if (!targetId) return false
+    const ok = await setSessionModel(targetId, modelId, provider || '')
+    if (!ok) return false
+    const target = sessions.value.find(s => s.id === targetId)
+    if (target) {
+      target.model = modelId
+      target.provider = provider || ''
     }
+    if (activeSession.value?.id === targetId) {
+      activeSession.value.model = modelId
+      activeSession.value.provider = provider || ''
+    }
+    return true
   }
 
   async function deleteSession(sessionId: string) {
@@ -581,6 +717,94 @@ export const useChatStore = defineStore('chat', () => {
     }
   }
 
+  function addAgentErrorMessage(sessionId: string, error?: string | null) {
+    const content = error ? `Error: ${error}` : 'Run failed'
+    const msgs = getSessionMsgs(sessionId)
+    const last = msgs[msgs.length - 1]
+    if (last?.isStreaming) {
+      updateMessage(sessionId, last.id, {
+        role: 'assistant',
+        content,
+        isStreaming: false,
+        systemType: 'error',
+      })
+      return
+    }
+    if (last?.role === 'assistant' && last.systemType === 'error' && last.content === content) return
+    addMessage(sessionId, {
+      id: uid(),
+      role: 'assistant',
+      content,
+      timestamp: Date.now(),
+      systemType: 'error',
+    })
+  }
+
+  function handleSessionCommandEvent(evt: RunEvent) {
+    const sid = evt.session_id
+    if (!sid) return
+    const target = sessions.value.find(s => s.id === sid)
+    const action = (evt as any).action as string | undefined
+
+    if (action === 'clear') {
+      if (target) target.messages = []
+      queuedUserMessages.value.delete(sid)
+      queueLengths.value.delete(sid)
+      if ((evt as any).clearHistory) {
+        const message = String((evt as any).message || '')
+        if (message) {
+          addMessage(sid, {
+            id: uid(),
+            role: 'command',
+            content: message,
+            timestamp: Date.now(),
+            systemType: (evt as any).ok === false ? 'error' : 'command',
+            commandAction: action,
+            commandData: { ...(evt as any) },
+          })
+        }
+      }
+      return
+    }
+
+    if (action === 'title' && target && typeof (evt as any).title === 'string') {
+      target.title = (evt as any).title
+      target.updatedAt = Date.now()
+    }
+
+    if (action === 'usage' && target) {
+      target.inputTokens = (evt as any).inputTokens
+      target.outputTokens = (evt as any).outputTokens
+      if ((evt as any).contextTokens != null) target.contextTokens = (evt as any).contextTokens
+    }
+
+    if (action === 'destroy') {
+      streamStates.value.delete(sid)
+      serverWorking.value.delete(sid)
+      queueLengths.value.delete(sid)
+      queuedUserMessages.value.delete(sid)
+      setAbortState(null)
+      const msgs = getSessionMsgs(sid)
+      msgs.forEach(m => {
+        if (m.isStreaming) updateMessage(sid, m.id, { isStreaming: false })
+        if (m.role === 'tool' && m.toolStatus === 'running') m.toolStatus = 'error'
+      })
+    }
+
+    const message = String((evt as any).message || '')
+    if (message) {
+      addMessage(sid, {
+        id: uid(),
+        role: 'command',
+        content: message,
+        timestamp: Date.now(),
+        systemType: (evt as any).ok === false ? 'error' : 'command',
+        commandAction: action,
+        commandData: { ...(evt as any) },
+      })
+    }
+  }
+
   function enqueueUserMessage(sessionId: string, message: Message) {
     const queue = queuedUserMessages.value.get(sessionId) || []
     queue.push({ ...message, queued: true })
@@ -601,6 +825,45 @@ export const useChatStore = defineStore('chat', () => {
       session_id: sessionId,
       queue_id: messageId,
     })
+  }
+
+  function setPendingApproval(evt: RunEvent) {
+    const sid = evt.session_id
+    const approvalId = (evt as any).approval_id as string | undefined
+    if (!sid || !approvalId) return
+    const rawChoices = Array.isArray((evt as any).choices) ? (evt as any).choices : ['once', 'session', 'deny']
+    const choices = rawChoices
+      .filter((choice: unknown): choice is PendingApproval['choices'][number] =>
+        choice === 'once' || choice === 'session' || choice === 'always' || choice === 'deny')
+    pendingApprovals.value.set(sid, {
+      sessionId: sid,
+      approvalId,
+      command: String((evt as any).command || ''),
+      description: String((evt as any).description || ''),
+      choices: choices.length ? choices : ['once', 'session', 'deny'],
+      allowPermanent: Boolean((evt as any).allow_permanent),
+      requestedAt: Date.now(),
+    })
+    pendingApprovals.value = new Map(pendingApprovals.value)
+  }
+
+  function clearPendingApproval(evt: RunEvent) {
+    const sid = evt.session_id
+    if (!sid) return
+    const current = pendingApprovals.value.get(sid)
+    if (!current) return
+    const approvalId = (evt as any).approval_id
+    if (approvalId && current.approvalId !== approvalId) return
+    pendingApprovals.value.delete(sid)
+    pendingApprovals.value = new Map(pendingApprovals.value)
+  }
+
+  function respondApproval(choice: PendingApproval['choices'][number]) {
+    const pending = activePendingApproval.value
+    if (!pending) return
+    respondToolApproval(pending.sessionId, pending.approvalId, choice)
+    pendingApprovals.value.delete(pending.sessionId)
+    pendingApprovals.value = new Map(pendingApprovals.value)
   }
 
   function showNextQueuedUserMessage(sessionId: string) {
@@ -655,15 +918,22 @@ export const useChatStore = defineStore('chat', () => {
 
     // Capture session ID at send time — all callbacks use this, not activeSessionId
     const sid = activeSessionId.value!
-    const shouldQueue = isSessionLive(sid)
+    const shouldSendInitialSessionConfig = activeSession.value
+      ? activeSession.value.messageCount == null || activeSession.value.messageCount === 0
+      : false
+    const isBridgeSlashCommand = content.trim().startsWith('/')
+    const isBridgeCompressCommand = isBridgeSlashCommand && /^\/compress(?:\s|$)/i.test(content.trim())
+    const wasLiveBeforeSend = isSessionLive(sid)
+    const shouldQueue = wasLiveBeforeSend && !isBridgeSlashCommand
 
     const userMsg: Message = {
       id: uid(),
-      role: 'user',
+      role: isBridgeSlashCommand ? 'command' : 'user',
       content: content.trim(),
       timestamp: Date.now(),
       attachments: attachments && attachments.length > 0 ? attachments : undefined,
       queued: shouldQueue,
+      systemType: isBridgeSlashCommand ? 'command' : undefined,
     }
 
     if (!shouldQueue) {
@@ -709,12 +979,24 @@ export const useChatStore = defineStore('chat', () => {
       }
 
       const appStore = useAppStore()
+      await appStore.waitForModelsForRun()
       const sessionModel = activeSession.value?.model || appStore.selectedModel
+      const sessionProvider = activeSession.value?.provider || appStore.selectedProvider
       const runPayload = {
         input,
         session_id: sid,
-        model: sessionModel || undefined,
+        profile: shouldSendInitialSessionConfig ? activeSession.value?.profile || undefined : undefined,
+        model: shouldSendInitialSessionConfig ? sessionModel || undefined : undefined,
+        provider: shouldSendInitialSessionConfig ? sessionProvider || undefined : undefined,
+        model_groups: appStore.modelGroups.map(group => ({
+          provider: group.provider,
+          models: group.models,
+        })),
         queue_id: userMsg.id,
+        source: 'cli' as const,
+      }
+      if (shouldSendInitialSessionConfig && activeSession.value) {
+        activeSession.value.messageCount = Math.max(activeSession.value.messageCount || 0, 1)
       }
 
       if (shouldQueue) {
@@ -759,6 +1041,7 @@ export const useChatStore = defineStore('chat', () => {
           switch (evt.event) {
             case 'run.started':
               setAbortState(null)
+              setCompressionState(null)
               runProducedAssistantText = false
               runHadToolActivity = false
               closeStreamingAssistant()
@@ -775,6 +1058,11 @@ export const useChatStore = defineStore('chat', () => {
               break
             }
 
+            case 'session.command': {
+              handleSessionCommandEvent(evt)
+              break
+            }
+
             case 'compression.started': {
               setCompressionState({
                 compressing: true,
@@ -787,14 +1075,19 @@ export const useChatStore = defineStore('chat', () => {
             }
 
             case 'compression.completed': {
+              const afterTokens = (evt as any).contextTokens || (evt as any).afterTokens || 0
               setCompressionState({
                 compressing: false,
                 messageCount: (evt as any).totalMessages || 0,
                 beforeTokens: (evt as any).beforeTokens || 0,
-                afterTokens: (evt as any).afterTokens || 0,
+                afterTokens,
                 compressed: (evt as any).compressed ?? false,
                 error: (evt as any).error,
               })
+              if ((evt as any).contextTokens != null) {
+                const target = sessions.value.find(s => s.id === sid)
+                if (target) target.contextTokens = (evt as any).contextTokens
+              }
               // Auto-clear after 5s
               setTimeout(() => {
                 if (compressionState.value && !compressionState.value.compressing) {
@@ -954,16 +1247,26 @@ export const useChatStore = defineStore('chat', () => {
                 : msgs.filter(m => m.role === 'tool' && m.toolStatus === 'running')
               if (toolMsgs.length > 0) {
                 const last = toolMsgs[toolMsgs.length - 1]
-                // Check if tool errored
-                const hasError = (evt as any).error === true
+                const output = typeof (evt as any).output === 'string' ? (evt as any).output : undefined
+                const hasError = (evt as any).error === true || isToolOutputError(output)
                 const duration = (evt as any).duration
                 updateMessage(sid, last.id, {
                   toolStatus: hasError ? 'error' : 'done',
                   toolDuration: duration,
-                  toolResult: typeof (evt as any).output === 'string' ? (evt as any).output : undefined,
+                  toolResult: output,
                 })
               }
 
+              break
+            }
+
+            case 'approval.requested': {
+              setPendingApproval(evt)
+              break
+            }
+
+            case 'approval.resolved': {
+              clearPendingApproval(evt)
               break
             }
 
@@ -981,6 +1284,7 @@ export const useChatStore = defineStore('chat', () => {
                 if (target) {
                   target.inputTokens = (evt as any).inputTokens
                   target.outputTokens = (evt as any).outputTokens
+                  if ((evt as any).contextTokens != null) target.contextTokens = (evt as any).contextTokens
                 }
               }
               // Belt-and-suspenders: some providers may deliver the final
@@ -1070,22 +1374,16 @@ export const useChatStore = defineStore('chat', () => {
             }
 
             case 'run.failed': {
-              const msgs = getSessionMsgs(sid)
-              const lastErr = msgs[msgs.length - 1]
-              if (lastErr?.isStreaming) {
-                updateMessage(sid, lastErr.id, {
-                  isStreaming: false,
-                  content: evt.error ? `Error: ${evt.error}` : 'Run failed',
-                  role: 'system',
-                })
-              } else {
-                addMessage(sid, {
-                  id: uid(),
-                  role: 'system',
-                  content: evt.error ? `Error: ${evt.error}` : 'Run failed',
-                  timestamp: Date.now(),
-                })
+              if ((evt as any).inputTokens != null) {
+                const target = sessions.value.find(s => s.id === sid)
+                if (target) {
+                  target.inputTokens = (evt as any).inputTokens
+                  target.outputTokens = (evt as any).outputTokens
+                  if ((evt as any).contextTokens != null) target.contextTokens = (evt as any).contextTokens
+                }
               }
+              addAgentErrorMessage(sid, evt.error)
+              const msgs = getSessionMsgs(sid)
               msgs.forEach((m, i) => {
                 if (m.role === 'tool' && m.toolStatus === 'running') {
                   msgs[i] = { ...m, toolStatus: 'error' }
@@ -1104,6 +1402,7 @@ export const useChatStore = defineStore('chat', () => {
               if (target) {
                 target.inputTokens = (evt as any).inputTokens
                 target.outputTokens = (evt as any).outputTokens
+                if ((evt as any).contextTokens != null) target.contextTokens = (evt as any).contextTokens
               }
               break
             }
@@ -1122,25 +1421,21 @@ export const useChatStore = defineStore('chat', () => {
         // onError
         (err) => {
           console.warn('Socket.IO run stream error:', err.message)
+          addAgentErrorMessage(sid, err.message)
           const msgs = getSessionMsgs(sid)
-          const last = msgs[msgs.length - 1]
-          if (last?.isStreaming) {
-            updateMessage(sid, last.id, { isStreaming: false })
-          }
           msgs.forEach((m, i) => {
             if (m.role === 'tool' && m.toolStatus === 'running') {
-              msgs[i] = { ...m, toolStatus: 'done' }
+              msgs[i] = { ...m, toolStatus: 'error' }
             }
           })
           cleanup()
-          if (sid === activeSessionId.value) {
-            void refreshActiveSession()
-          }
         },
         undefined,
       )
 
-      streamStates.value.set(sid, ctrl)
+      if (!isBridgeSlashCommand || isBridgeCompressCommand) {
+        streamStates.value.set(sid, ctrl)
+      }
     } catch (err: any) {
       addMessage(sid, {
         id: uid(),
@@ -1201,8 +1496,14 @@ export const useChatStore = defineStore('chat', () => {
           break
         }
 
+        case 'session.command': {
+          handleSessionCommandEvent(evt)
+          break
+        }
+
         case 'run.started':
           setAbortState(null)
+          setCompressionState(null)
           runProducedAssistantText = false
           runHadToolActivity = false
           closeStreamingAssistant()
@@ -1226,14 +1527,19 @@ export const useChatStore = defineStore('chat', () => {
         }
 
         case 'compression.completed': {
+          const afterTokens = (evt as any).contextTokens || (evt as any).afterTokens || 0
           setCompressionState({
             compressing: false,
             messageCount: (evt as any).totalMessages || 0,
             beforeTokens: (evt as any).beforeTokens || 0,
-            afterTokens: (evt as any).afterTokens || 0,
+            afterTokens,
             compressed: (evt as any).compressed ?? false,
             error: (evt as any).error,
           })
+          if ((evt as any).contextTokens != null) {
+            const target = sessions.value.find(s => s.id === sid)
+            if (target) target.contextTokens = (evt as any).contextTokens
+          }
           setTimeout(() => {
             if (compressionState.value && !compressionState.value.compressing) {
               setCompressionState(null)
@@ -1383,14 +1689,25 @@ export const useChatStore = defineStore('chat', () => {
             ? msgs.filter(m => m.role === 'tool' && m.toolCallId === toolCallId)
             : msgs.filter(m => m.role === 'tool' && m.toolStatus === 'running')
           if (toolMsgs.length > 0) {
-            const hasError = (evt as any).error === true
+            const output = typeof (evt as any).output === 'string' ? (evt as any).output : undefined
+            const hasError = (evt as any).error === true || isToolOutputError(output)
             updateMessage(sid, toolMsgs[toolMsgs.length - 1].id, {
               toolStatus: hasError ? 'error' : 'done',
               toolDuration: (evt as any).duration,
-              toolResult: typeof (evt as any).output === 'string' ? (evt as any).output : undefined,
+              toolResult: output,
             })
           }
 
+          break
+        }
+
+        case 'approval.requested': {
+          setPendingApproval(evt)
+          break
+        }
+
+        case 'approval.resolved': {
+          clearPendingApproval(evt)
           break
         }
 
@@ -1414,6 +1731,7 @@ export const useChatStore = defineStore('chat', () => {
             if (target) {
               target.inputTokens = (evt as any).inputTokens
               target.outputTokens = (evt as any).outputTokens
+              if ((evt as any).contextTokens != null) target.contextTokens = (evt as any).contextTokens
             }
           }
           // Check if backend provided parsed content (from stringified array format)
@@ -1483,28 +1801,22 @@ export const useChatStore = defineStore('chat', () => {
         }
 
         case 'run.failed': {
+          if ((evt as any).inputTokens != null) {
+            const target = sessions.value.find(s => s.id === sid)
+            if (target) {
+              target.inputTokens = (evt as any).inputTokens
+              target.outputTokens = (evt as any).outputTokens
+              if ((evt as any).contextTokens != null) target.contextTokens = (evt as any).contextTokens
+            }
+          }
           const hasQueue = (evt as any).queue_remaining > 0
           if (hasQueue) {
             queueLengths.value.set(sid, (evt as any).queue_remaining)
           } else {
             queueLengths.value.delete(sid)
           }
+          addAgentErrorMessage(sid, evt.error)
           const msgs = getSessionMsgs(sid)
-          const lastErr = msgs[msgs.length - 1]
-          if (lastErr?.isStreaming) {
-            updateMessage(sid, lastErr.id, {
-              isStreaming: false,
-              content: evt.error ? `Error: ${evt.error}` : 'Run failed',
-              role: 'system',
-            })
-          } else {
-            addMessage(sid, {
-              id: uid(),
-              role: 'system',
-              content: evt.error ? `Error: ${evt.error}` : 'Run failed',
-              timestamp: Date.now(),
-            })
-          }
           msgs.forEach((m, i) => {
             if (m.role === 'tool' && m.toolStatus === 'running') {
               msgs[i] = { ...m, toolStatus: 'error' }
@@ -1521,6 +1833,7 @@ export const useChatStore = defineStore('chat', () => {
           if (target) {
             target.inputTokens = (evt as any).inputTokens
             target.outputTokens = (evt as any).outputTokens
+            if ((evt as any).contextTokens != null) target.contextTokens = (evt as any).contextTokens
           }
           break
         }
@@ -1543,6 +1856,7 @@ export const useChatStore = defineStore('chat', () => {
       onAbortStarted: (evt) => handleEvent(evt),
       onAbortCompleted: (evt) => handleEvent(evt),
       onUsageUpdated: (evt) => handleEvent(evt),
+      onSessionCommand: (evt) => handleEvent(evt),
       onRunQueued: (evt) => handleEvent(evt),
     })
 
@@ -1684,17 +1998,21 @@ export const useChatStore = defineStore('chat', () => {
     isStreaming,
     isRunActive,
     isSessionLive,
+    sessionProfileFilter,
     compressionState,
     abortState,
     isAborting,
     queueLengths,
     queuedUserMessages,
+    pendingApprovals,
+    activePendingApproval,
     removeQueuedMessage,
     isLoadingSessions,
     sessionsLoaded,
     isLoadingMessages,
 
     newChat,
+    newCliSession,
     switchSession,
     switchSessionModel,
     addOrUpdateSession,
@@ -1702,6 +2020,7 @@ export const useChatStore = defineStore('chat', () => {
     deleteSession,
     sendMessage,
     stopStreaming,
+    respondApproval,
     loadSessions,
     refreshActiveSession,
     getThinkingObservation,

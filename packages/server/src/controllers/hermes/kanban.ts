@@ -3,6 +3,7 @@ import { readFile } from 'fs/promises'
 import { resolve, normalize } from 'path'
 import { homedir } from 'os'
 import * as kanbanCli from '../../services/hermes/hermes-kanban'
+import { isPathWithin } from '../../services/hermes/hermes-path'
 import {
   searchSessionSummariesWithProfile,
   getSessionDetailFromDbWithProfile,
@@ -41,6 +42,7 @@ function validSeverity(value?: string): value is 'warning' | 'error' | 'critical
 const MAX_LOG_TAIL_BYTES = 1_000_000
 const MAX_DISPATCH_TASKS = 100
 const MAX_DISPATCH_FAILURE_LIMIT = 100
+const MAX_BULK_TASKS = 100
 
 type PositiveIntegerResult = { value?: number; error?: string }
 type StringResult = { value?: string; error?: string }
@@ -82,6 +84,25 @@ function requestBody(ctx: Context): BodyResult {
 function optionalString(value: unknown, name: string): StringResult {
   if (value === undefined || value === null) return {}
   if (typeof value !== 'string') return { error: `${name} must be a string` }
+  return { value }
+}
+
+function optionalNullableString(value: unknown, name: string): { value?: string | null; error?: string } {
+  if (value === undefined) return {}
+  if (value === null) return { value: null }
+  if (typeof value !== 'string') return { error: `${name} must be a string` }
+  return { value }
+}
+
+function hasOwn(body: Record<string, unknown>, key: string): boolean {
+  return Object.prototype.hasOwnProperty.call(body, key)
+}
+
+function optionalTaskStatus(value: unknown, name: string): { value?: kanbanCli.KanbanTaskStatus; error?: string } {
+  if (value === undefined || value === null) return {}
+  if (value !== 'triage' && value !== 'todo' && value !== 'ready' && value !== 'running' && value !== 'blocked' && value !== 'done' && value !== 'archived') {
+    return { error: `${name} must be a valid kanban task status` }
+  }
   return { value }
 }
 
@@ -364,6 +385,80 @@ export async function addComment(ctx: Context) {
   }
 }
 
+export async function linkTasks(ctx: Context) {
+  const bodyResult = requestBody(ctx)
+  if (rejectBadRequest(ctx, bodyResult.error)) return
+  const parentId = requiredNonEmptyString(bodyResult.body.parent_id, 'parent_id')
+  const childId = requiredNonEmptyString(bodyResult.body.child_id, 'child_id')
+  if (rejectBadRequest(ctx, parentId.error || childId.error)) return
+  const board = requestBoard(ctx)
+  if (!board) return
+  try {
+    ctx.body = await kanbanCli.linkTasks(parentId.value!.trim(), childId.value!.trim(), { board })
+  } catch (err: any) {
+    ctx.status = 500
+    ctx.body = { error: err.message }
+  }
+}
+
+export async function unlinkTasks(ctx: Context) {
+  const parentId = requiredNonEmptyString(firstQueryValue(ctx.query.parent_id as string | string[] | undefined), 'parent_id')
+  const childId = requiredNonEmptyString(firstQueryValue(ctx.query.child_id as string | string[] | undefined), 'child_id')
+  if (rejectBadRequest(ctx, parentId.error || childId.error)) return
+  const board = requestBoard(ctx)
+  if (!board) return
+  try {
+    ctx.body = await kanbanCli.unlinkTasks(parentId.value!.trim(), childId.value!.trim(), { board })
+  } catch (err: any) {
+    ctx.status = 500
+    ctx.body = { error: err.message }
+  }
+}
+
+export async function bulkUpdateTasks(ctx: Context) {
+  const bodyResult = requestBody(ctx)
+  if (rejectBadRequest(ctx, bodyResult.error)) return
+  const body = bodyResult.body
+  const ids = requiredNonEmptyStringArray(body.ids, 'ids')
+  const status = optionalTaskStatus(body.status, 'status')
+  const assignee = optionalNullableString(body.assignee, 'assignee')
+  const archive = optionalBoolean(body.archive, 'archive')
+  const summary = optionalString(body.summary, 'summary')
+  const reason = optionalString(body.reason, 'reason')
+  if (rejectBadRequest(ctx, ids.error || status.error || assignee.error || archive.error || summary.error || reason.error)) return
+  if (!archive.value && status.value === undefined && !hasOwn(body, 'assignee')) {
+    ctx.status = 400
+    ctx.body = { error: 'at least one bulk action is required' }
+    return
+  }
+  if (ids.value!.length > MAX_BULK_TASKS) {
+    ctx.status = 400
+    ctx.body = { error: `ids must contain <= ${MAX_BULK_TASKS} tasks` }
+    return
+  }
+  if (archive.value && status.value !== undefined) {
+    ctx.status = 400
+    ctx.body = { error: 'archive cannot be combined with status' }
+    return
+  }
+  const board = requestBoard(ctx)
+  if (!board) return
+  try {
+    ctx.body = await kanbanCli.bulkUpdateTasks({
+      board,
+      ids: ids.value!.map(id => id.trim()),
+      status: status.value,
+      assignee: assignee.value,
+      archive: archive.value,
+      summary: summary.value,
+      reason: reason.value,
+    })
+  } catch (err: any) {
+    ctx.status = 500
+    ctx.body = { error: err.message }
+  }
+}
+
 export async function taskLog(ctx: Context) {
   const board = requestBoard(ctx)
   if (!board) return
@@ -502,7 +597,7 @@ export async function readArtifact(ctx: Context) {
   const kanbanDir = resolve(homedir(), '.hermes', 'kanban', 'workspaces')
   const resolved = resolve(normalize(filePath))
 
-  if (!resolved.startsWith(kanbanDir)) {
+  if (!isPathWithin(resolved, kanbanDir)) {
     ctx.status = 403
     ctx.body = { error: 'Path must be within kanban workspaces' }
     return

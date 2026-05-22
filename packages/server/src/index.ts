@@ -10,15 +10,18 @@ import { readFileSync } from 'fs'
 import { config } from './config'
 import { getToken, requireAuth } from './services/auth'
 import { initLoginLimiter } from './services/login-limiter'
-import { initGatewayManager, getGatewayManagerInstance } from './services/gateway-bootstrap'
 import { bindShutdown } from './services/shutdown'
 import { setupTerminalWebSocket } from './routes/hermes/terminal'
+import { setupKanbanEventsWebSocket } from './routes/hermes/kanban-events'
 import { startVersionCheck } from './routes/health'
 import { registerRoutes } from './routes'
 import { setGroupChatServer } from './routes/hermes/group-chat'
 import { setChatRunServer } from './routes/hermes/chat-run'
 import { GroupChatServer } from './services/hermes/group-chat'
-import { ChatRunSocket } from './services/hermes/chat-run-socket'
+import { ChatRunSocket } from './services/hermes/run-chat'
+import { startAgentBridgeManager } from './services/hermes/agent-bridge'
+import { HermesSkillInjector } from './services/hermes/skill-injector'
+import { ensureProfileGatewaysRunning } from './services/hermes/gateway-autostart'
 import { logger } from './services/logger'
 
 // Injected by esbuild at build time; fallback to reading package.json in dev mode
@@ -36,15 +39,15 @@ process.on('uncaughtException', (err) => {
 })
 
 process.on('unhandledRejection', (reason) => {
-  console.error('FATAL: Unhandled rejection')
+  console.error('Unhandled rejection')
   console.error(reason)
   logger.error(reason, 'Unhandled rejection')
-  process.exit(1)
 })
 
 let server: any = null
 let servers: any[] = []
 let chatRunServer: any = null
+let agentBridgeManager: any = null
 
 interface ListenResult {
   primary: any
@@ -85,14 +88,43 @@ export async function bootstrap() {
 
   const authToken = await getToken()
   await initLoginLimiter()
+  try {
+    const skillInjector = new HermesSkillInjector()
+    const injectionResult = await skillInjector.injectMissingSkills()
+    if (injectionResult.injected.length > 0) {
+      logger.info({
+        injected: [...new Set(injectionResult.injected)],
+        targetCount: injectionResult.targets.length,
+      }, '[bootstrap] bundled skills injected')
+    }
+    if (injectionResult.updated.length > 0) {
+      logger.info({
+        updated: [...new Set(injectionResult.updated)],
+        targetCount: injectionResult.targets.length,
+      }, '[bootstrap] bundled skills updated')
+    }
+  } catch (err) {
+    logger.warn(err, '[bootstrap] failed to inject bundled skills')
+    console.warn('[bootstrap] failed to inject bundled skills:', err instanceof Error ? err.message : err)
+  }
 
-  // Debug: log environment variable
-  console.log('[bootstrap] HERMES_WEB_UI_STOP_GATEWAYS_ON_SHUTDOWN =', process.env.HERMES_WEB_UI_STOP_GATEWAYS_ON_SHUTDOWN)
+  try {
+    await ensureProfileGatewaysRunning()
+    console.log('[bootstrap] profile gateways checked')
+  } catch (err) {
+    logger.warn(err, '[bootstrap] failed to ensure profile gateways')
+    console.warn('[bootstrap] failed to ensure profile gateways:', err instanceof Error ? err.message : err)
+  }
 
   const app = new Koa()
 
-  await initGatewayManager()
-  console.log('[bootstrap] gateway manager initialized')
+  try {
+    agentBridgeManager = await startAgentBridgeManager()
+    console.log('[bootstrap] agent bridge started')
+  } catch (err) {
+    logger.warn(err, '[bootstrap] agent bridge failed to start')
+    console.warn('[bootstrap] agent bridge failed to start:', err instanceof Error ? err.message : err)
+  }
   await new Promise(resolve => setTimeout(resolve, 1000))
   // Initialize all web-ui SQLite tables
   const { initAllStores } = await import('./db/hermes/init')
@@ -100,11 +132,6 @@ export async function bootstrap() {
   initAllStores()
   await new Promise(resolve => setTimeout(resolve, 1000))
   console.log('[bootstrap] all stores initialized')
-
-  // Sync Hermes sessions from all profiles (only if local DB is empty)
-  const { syncAllHermesSessionsOnStartup } = await import('./services/hermes/session-sync')
-  await syncAllHermesSessionsOnStartup()
-  console.log('[bootstrap] Hermes session sync completed')
 
   app.use(cors({ origin: config.corsOrigins }))
   app.use(bodyParser())
@@ -140,15 +167,15 @@ export async function bootstrap() {
   console.log('[bootstrap] app.listen called')
 
   setupTerminalWebSocket(servers)
-  console.log('[bootstrap] terminal websocket setup')
+  setupKanbanEventsWebSocket(servers)
+  console.log('[bootstrap] terminal + kanban websocket setup')
 
   // Group chat Socket.IO (must be after server is created)
   const groupChatServer = new GroupChatServer(servers)
   setGroupChatServer(groupChatServer)
-  groupChatServer.setGatewayManager(getGatewayManagerInstance())
 
   // Chat run Socket.IO — shares the same Server instance, just adds /chat-run namespace
-  chatRunServer = new ChatRunSocket(groupChatServer.getIO(), getGatewayManagerInstance())
+  chatRunServer = new ChatRunSocket(groupChatServer.getIO())
   setChatRunServer(chatRunServer)
   chatRunServer.init()
 
@@ -163,7 +190,7 @@ export async function bootstrap() {
   servers.forEach((httpServer) => {
     httpServer.on('upgrade', (req: any, socket: any) => {
       const url = new URL(req.url || '', `http://${req.headers.host}`)
-      if (url.pathname !== '/api/hermes/terminal' && !url.pathname.startsWith('/socket.io/')) {
+      if (url.pathname !== '/api/hermes/terminal' && url.pathname !== '/api/hermes/kanban/events' && !url.pathname.startsWith('/socket.io/')) {
         socket.destroy()
       }
     })
@@ -172,7 +199,7 @@ export async function bootstrap() {
   const interfaces = safeNetworkInterfaces()
   const localIp = Object.values(interfaces).flat().find(i => i?.family === 'IPv4' && !i?.internal)?.address || 'localhost'
   console.log(`Server: http://localhost:${config.port} (LAN: http://${localIp}:${config.port})`)
-  console.log(`Log: ~/.hermes-web-ui/logs/server.log`)
+  console.log(`Log: ${config.appHome}/logs/server.log`)
   logger.info('Server: http://localhost:%d (LAN: http://%s:%d)', config.port, localIp, config.port)
 
   // Restore group chat agents after server is ready.
@@ -185,7 +212,7 @@ export async function bootstrap() {
     })
   })
 
-  bindShutdown(servers, groupChatServer, chatRunServer)
+  bindShutdown(servers, groupChatServer, chatRunServer, agentBridgeManager)
   startVersionCheck()
 }
 

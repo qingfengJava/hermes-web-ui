@@ -51,6 +51,11 @@ const router = createRouter({
       component: () => import('@/views/hermes/UsageView.vue'),
     },
     {
+      path: '/hermes/skills-usage',
+      name: 'hermes.skillsUsage',
+      component: () => import('@/views/hermes/SkillsUsageView.vue'),
+    },
+    {
       path: '/hermes/skills',
       name: 'hermes.skills',
       component: () => import('@/views/hermes/SkillsView.vue'),
@@ -69,11 +74,6 @@ const router = createRouter({
       path: '/hermes/settings',
       name: 'hermes.settings',
       component: () => import('@/views/hermes/SettingsView.vue'),
-    },
-    {
-      path: '/hermes/gateways',
-      name: 'hermes.gateways',
-      component: () => import('@/views/hermes/GatewaysView.vue'),
     },
     {
       path: '/hermes/channels',

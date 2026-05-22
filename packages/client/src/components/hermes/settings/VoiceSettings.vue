@@ -19,6 +19,7 @@ const providerOptions = [
   { label: t('settings.voice.providerOpenai'), value: 'openai' },
   { label: t('settings.voice.providerCustom'), value: 'custom' },
   { label: t('settings.voice.providerEdge'), value: 'edge' },
+  { label: t('settings.voice.providerMimo'), value: 'mimo' },
 ]
 
 const openaiModelOptions = [
@@ -41,6 +42,12 @@ const edgeVoiceOptions = [
   { label: '云希 (zh-CN-YunxiNeural)', value: 'zh-CN-YunxiNeural' },
   { label: '云健 (zh-CN-YunjianNeural)', value: 'zh-CN-YunjianNeural' },
   { label: '云扬 (zh-CN-YunyangNeural)', value: 'zh-CN-YunyangNeural' },
+  { label: '小晨 (zh-TW-HsiaoChenNeural)', value: 'zh-TW-HsiaoChenNeural' },
+  { label: '小宇 (zh-TW-HsiaoYuNeural)', value: 'zh-TW-HsiaoYuNeural' },
+  { label: '云哲 (zh-TW-YunJheNeural)', value: 'zh-TW-YunJheNeural' },
+  { label: '希雅 (zh-HK-HiuGaaiNeural)', value: 'zh-HK-HiuGaaiNeural' },
+  { label: '希文 (zh-HK-HiuMaanNeural)', value: 'zh-HK-HiuMaanNeural' },
+  { label: '文龙 (zh-HK-WanLungNeural)', value: 'zh-HK-WanLungNeural' },
   { label: 'Jenny (en-US-JennyNeural)', value: 'en-US-JennyNeural' },
   { label: 'Aria (en-US-AriaNeural)', value: 'en-US-AriaNeural' },
   { label: 'Guy (en-US-GuyNeural)', value: 'en-US-GuyNeural' },
@@ -69,6 +76,28 @@ onMounted(() => {
     }
   }
 })
+
+// ── MiMo TTS options ──
+const mimoBaseUrlOptions = [
+  { label: 'https://api.xiaomimimo.com/v1', value: 'https://api.xiaomimimo.com/v1' },
+  { label: 'https://token-plan-cn.xiaomimimo.com/v1', value: 'https://token-plan-cn.xiaomimimo.com/v1' },
+]
+
+const mimoModelOptions = [
+  { label: t('settings.voice.mimoModelPreset'), value: 'mimo-v2.5-tts' },
+  { label: t('settings.voice.mimoModelVoiceDesign'), value: 'mimo-v2.5-tts-voicedesign' },
+]
+
+const mimoVoiceOptions = [
+  { label: '冰糖 (中文·女)', value: '冰糖' },
+  { label: '茉莉 (中文·女)', value: '茉莉' },
+  { label: '苏打 (中文·男)', value: '苏打' },
+  { label: '白桦 (中文·男)', value: '白桦' },
+  { label: 'Mia (English·Female)', value: 'Mia' },
+  { label: 'Chloe (English·Female)', value: 'Chloe' },
+  { label: 'Milo (English·Male)', value: 'Milo' },
+  { label: 'Dean (English·Male)', value: 'Dean' },
+]
 
 async function handleTest() {
   const text = testText.value.trim()
@@ -106,6 +135,19 @@ async function handleTest() {
         voice: vs.edgeVoice.value,
         rate: speedToEdgeRate(vs.edgeRate.value),
         pitch: hzToEdgePitch(vs.edgePitchHz.value),
+      })
+    } else if (vs.provider.value === 'mimo') {
+      if (!vs.mimoApiKey.value) {
+        console.warn('[VoiceSettings] MiMo API Key empty')
+        return
+      }
+      await speech.mimoPlay('__test__', text, {
+        baseUrl: vs.mimoBaseUrl.value,
+        apiKey: vs.mimoApiKey.value,
+        model: vs.mimoModel.value,
+        voice: vs.mimoVoice.value,
+        voiceDesignDesc: vs.mimoVoiceDesignDesc.value || undefined,
+        stylePrompt: vs.mimoStylePrompt.value || undefined,
       })
     }
   } catch (err) {
@@ -304,6 +346,104 @@ async function handleTest() {
         </div>
       </SettingRow>
 
+    </template>
+
+    <!-- ════ MiMo TTS ════ -->
+    <template v-if="vs.provider.value === 'mimo'">
+      <div class="provider-hint">
+        {{ t('settings.voice.mimoHint') }}
+      </div>
+
+      <SettingRow
+        :label="t('settings.voice.mimoApiKey')"
+        :hint="t('settings.voice.mimoApiKeyHint')"
+      >
+        <NInput
+          :value="vs.mimoApiKey.value"
+          type="password"
+          size="small"
+          show-password-on="click"
+          style="width: 360px"
+          :placeholder="t('settings.voice.mimoApiKeyPlaceholder')"
+          @update:value="vs.setMimoApiKey"
+        />
+      </SettingRow>
+
+      <SettingRow
+        :label="t('settings.voice.mimoBaseUrl')"
+        :hint="t('settings.voice.mimoBaseUrlHint')"
+      >
+        <NSelect
+          :value="vs.mimoBaseUrl.value"
+          :options="mimoBaseUrlOptions"
+          size="small"
+          filterable
+          tag
+          style="width: 360px"
+          @update:value="vs.setMimoBaseUrl"
+        />
+      </SettingRow>
+
+      <SettingRow
+        :label="t('settings.voice.mimoModel')"
+        :hint="t('settings.voice.mimoModelHint')"
+      >
+        <NSelect
+          :value="vs.mimoModel.value"
+          :options="mimoModelOptions"
+          size="small"
+          style="width: 320px"
+          @update:value="vs.setMimoModel"
+        />
+      </SettingRow>
+
+      <!-- Preset voice mode -->
+      <SettingRow
+        v-if="vs.mimoModel.value === 'mimo-v2.5-tts'"
+        :label="t('settings.voice.mimoVoice')"
+        :hint="t('settings.voice.mimoVoiceHint')"
+      >
+        <NSelect
+          :value="vs.mimoVoice.value"
+          :options="mimoVoiceOptions"
+          size="small"
+          style="width: 200px"
+          @update:value="vs.setMimoVoice"
+        />
+      </SettingRow>
+
+      <!-- Voice design mode -->
+      <SettingRow
+        v-if="vs.mimoModel.value === 'mimo-v2.5-tts-voicedesign'"
+        :label="t('settings.voice.mimoVoiceDesignPrompt')"
+        :hint="t('settings.voice.mimoVoiceDesignPromptHint')"
+      >
+        <NInput
+          :value="vs.mimoVoiceDesignDesc.value"
+          type="textarea"
+          size="small"
+          style="width: 360px"
+          :rows="3"
+          :placeholder="t('settings.voice.mimoVoiceDesignPromptPlaceholder')"
+          @update:value="vs.setMimoVoiceDesignDesc"
+        />
+      </SettingRow>
+
+      <!-- Style prompt (available for all models) -->
+      <SettingRow
+        :label="t('settings.voice.mimoStylePrompt')"
+        :hint="t('settings.voice.mimoStylePromptHint')"
+      >
+        <NInput
+          :value="vs.mimoStylePrompt.value"
+          type="textarea"
+          size="small"
+          style="width: 360px"
+          :rows="2"
+          :placeholder="t('settings.voice.mimoStylePromptPlaceholder')"
+          @update:value="vs.setMimoStylePrompt"
+        />
+      </SettingRow>
     </template>
 
     <!-- ─── Test / Audition ─── -->

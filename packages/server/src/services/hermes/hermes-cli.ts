@@ -1,12 +1,22 @@
 import { execFile, spawn } from 'child_process'
-import { existsSync } from 'fs'
+import { existsSync, readFileSync, unlinkSync } from 'fs'
+import { join } from 'path'
 import { promisify } from 'util'
+import YAML from 'js-yaml'
 import { logger } from '../logger'
+import { stripLegacyApiServerGatewayConfig, updateConfigYaml } from '../config-helpers'
+import { getActiveProfileDir, getActiveProfileName, getProfileDir, listProfileNamesFromDisk } from './hermes-profile'
+import { startGatewayRunManaged } from './gateway-runner'
+import { isGatewayRunningForProfile } from './gateway-autostart'
+import { parseProfileListRuntimeInfo, type ProfileListRuntimeInfo } from './profile-list-parser'
 
 const execFileAsync = promisify(execFile)
 
 const execOpts = { windowsHide: true }
 const isDocker = existsSync('/.dockerenv')
+const isTermux = !!process.env.TERMUX_VERSION ||
+  (process.env.PREFIX || '').includes('/com.termux/') ||
+  existsSync('/data/data/com.termux/files/usr')
 
 /**
  * 解析 Hermes CLI 二进制路径
@@ -17,6 +27,156 @@ function resolveHermesBin(): string {
 }
 
 const HERMES_BIN = resolveHermesBin()
+
+async function waitForGatewayRunning(profileDir: string, timeoutMs = 15000): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    if (await isGatewayRunningForProfile(HERMES_BIN, profileDir)) return true
+    await new Promise(resolve => setTimeout(resolve, 500))
+  }
+  return false
+}
+
+async function stopGatewayForActiveProfile(): Promise<void> {
+  try {
+    await execFileAsync(HERMES_BIN, ['gateway', 'stop'], {
+      timeout: 30000,
+      ...activeGatewayExecOpts(),
+    })
+  } catch (err) {
+    logger.warn(err, 'hermes gateway stop before restart failed; continuing with run --replace')
+  }
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, ms))
+}
+
+function isProcessAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch (err: any) {
+    return err?.code === 'EPERM'
+  }
+}
+
+function readJsonPid(path: string): number | null {
+  if (!existsSync(path)) return null
+  try {
+    const data = JSON.parse(readFileSync(path, 'utf-8'))
+    const pid = typeof data?.pid === 'number' ? data.pid : parseInt(String(data?.pid || ''), 10)
+    return Number.isFinite(pid) && pid > 0 ? pid : null
+  } catch {
+    return null
+  }
+}
+
+function readGatewayLockPid(profileDir: string): number | null {
+  return readJsonPid(join(profileDir, 'gateway.lock'))
+}
+
+function readGatewayStatePid(profileDir: string): number | null {
+  const pid = readJsonPid(join(profileDir, 'gateway.pid'))
+  if (pid) return pid
+  const statePath = join(profileDir, 'gateway_state.json')
+  if (!existsSync(statePath)) return null
+  try {
+    const data = JSON.parse(readFileSync(statePath, 'utf-8'))
+    const state = data?.gateway_state
+    const statePid = typeof data?.pid === 'number' ? data.pid : parseInt(String(data?.pid || ''), 10)
+    return statePid && Number.isFinite(statePid) && statePid > 0 && (state === 'running' || state === 'starting')
+      ? statePid
+      : null
+  } catch {
+    return null
+  }
+}
+
+async function killWindowsPid(pid: number): Promise<void> {
+  if (!pid || process.platform !== 'win32') return
+  try {
+    await execFileAsync('taskkill', ['/PID', String(pid), '/T', '/F'], {
+      timeout: 5000,
+      windowsHide: true,
+    })
+  } catch (err) {
+    logger.warn(err, 'Failed to taskkill gateway PID %d; falling back to process.kill', pid)
+    try { process.kill(pid) } catch {}
+  }
+}
+
+function cleanupStaleGatewayLock(profileDir: string, allowMalformedDelete = false): boolean {
+  const lockPath = join(profileDir, 'gateway.lock')
+  if (!existsSync(lockPath)) return true
+  try {
+    const lockData = JSON.parse(readFileSync(lockPath, 'utf-8'))
+    const pid = Number(lockData?.pid)
+    if (Number.isFinite(pid) && pid > 0 && isProcessAlive(pid)) return false
+    unlinkSync(lockPath)
+    return true
+  } catch {
+    if (!allowMalformedDelete) return false
+    try {
+      unlinkSync(lockPath)
+      return true
+    } catch {
+      return false
+    }
+  }
+}
+
+async function waitForGatewayLockReleased(profileDir: string, timeoutMs = 15000, allowMalformedDelete = false): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    if (cleanupStaleGatewayLock(profileDir, allowMalformedDelete)) return true
+    await sleep(500)
+  }
+  return cleanupStaleGatewayLock(profileDir, allowMalformedDelete)
+}
+
+async function forceReleaseWindowsGatewayLock(profileDir: string): Promise<void> {
+  if (process.platform !== 'win32') return
+  const pids = new Set<number>()
+  const lockPid = readGatewayLockPid(profileDir)
+  const statePid = readGatewayStatePid(profileDir)
+  if (lockPid) pids.add(lockPid)
+  if (statePid) pids.add(statePid)
+
+  for (const pid of pids) {
+    if (isProcessAlive(pid)) {
+      logger.warn('Gateway lock is still held by PID %d; force killing Windows process tree', pid)
+      await killWindowsPid(pid)
+    }
+  }
+}
+
+async function waitForGatewayLockReleasedAfterStop(profileDir: string, timeoutMs = 15000): Promise<boolean> {
+  if (await waitForGatewayLockReleased(profileDir, timeoutMs)) return true
+  await forceReleaseWindowsGatewayLock(profileDir)
+  return waitForGatewayLockReleased(profileDir, 5000, true)
+}
+
+function activeGatewayExecOpts() {
+  return {
+    ...execOpts,
+    env: {
+      ...process.env,
+      HERMES_HOME: getActiveProfileDir(),
+    },
+  }
+}
+
+async function clearLegacyApiServerGatewayConfig(): Promise<void> {
+  try {
+    await updateConfigYaml((config) => {
+      const result = stripLegacyApiServerGatewayConfig(config)
+      return { data: result.config, result: undefined, write: result.changed }
+    })
+  } catch (err) {
+    logger.warn(err, 'Failed to clear legacy api_server gateway config before restart')
+  }
+}
 
 export interface HermesSession {
   id: string
@@ -211,6 +371,26 @@ export async function deleteSession(id: string): Promise<boolean> {
 }
 
 /**
+ * Delete a session from a specific Hermes profile.
+ */
+export async function deleteSessionForProfile(id: string, profile: string): Promise<boolean> {
+  try {
+    await execFileAsync(HERMES_BIN, ['sessions', 'delete', id, '--yes'], {
+      timeout: 10000,
+      ...execOpts,
+      env: {
+        ...process.env,
+        HERMES_HOME: getProfileDir(profile),
+      },
+    })
+    return true
+  } catch (err: any) {
+    logger.error({ err, sessionId: id, profile }, 'Hermes CLI: profile session delete failed')
+    return false
+  }
+}
+
+/**
  * Rename a session title via Hermes CLI
  */
 export async function renameSession(id: string, title: string): Promise<boolean> {
@@ -255,7 +435,7 @@ export async function startGateway(): Promise<string> {
 
   const { stdout, stderr } = await execFileAsync(HERMES_BIN, ['gateway', 'start'], {
     timeout: 30000,
-    ...execOpts,
+    ...activeGatewayExecOpts(),
   })
   return stdout || stderr
 }
@@ -269,22 +449,49 @@ export async function startGatewayBackground(): Promise<number | null> {
     detached: true,
     stdio: 'ignore',
     windowsHide: true,
+    env: {
+      ...process.env,
+      HERMES_HOME: getActiveProfileDir(),
+    },
   })
   child.unref()
   return child.pid ?? null
 }
 
 /**
- * Restart Hermes gateway (stop then start)
+ * Restart Hermes gateway through Hermes CLI, falling back to detached
+ * `gateway run` when the environment does not support `gateway restart`.
  */
 export async function restartGateway(): Promise<string> {
-  try {
-    await stopGateway()
-  } catch (err) {
-    // Ignore stop errors, gateway might not be running
+  await clearLegacyApiServerGatewayConfig()
+  const profileDir = getActiveProfileDir()
+  if (isDocker || isTermux || process.platform === 'win32') {
+    await stopGatewayForActiveProfile()
+    const lockReleased = await waitForGatewayLockReleasedAfterStop(profileDir)
+    if (!lockReleased) throw new Error('Gateway stopped but runtime lock is still held by another process')
+    const result = startGatewayRunManaged(HERMES_BIN, { profileDir })
+    const ready = await waitForGatewayRunning(profileDir)
+    if (!ready) throw new Error(`Gateway run replace triggered but gateway did not report running within timeout${result.pid ? ` (PID: ${result.pid})` : ''}`)
+    return result.pid ? `Gateway run replaced (PID: ${result.pid})` : 'Gateway run replaced'
   }
-  const result = await startGateway()
-  return result
+  try {
+    const { stdout, stderr } = await execFileAsync(HERMES_BIN, ['gateway', 'restart'], {
+      timeout: 30000,
+      ...activeGatewayExecOpts(),
+    })
+    const ready = await waitForGatewayRunning(profileDir)
+    if (!ready) throw new Error('Hermes gateway restart completed but gateway did not report running within timeout')
+    return stdout || stderr
+  } catch (err: any) {
+    logger.warn(err, 'hermes gateway restart failed; falling back to gateway run')
+    await stopGatewayForActiveProfile()
+    const lockReleased = await waitForGatewayLockReleasedAfterStop(profileDir)
+    if (!lockReleased) throw new Error('Gateway restart failed and runtime lock is still held by another process')
+    const result = startGatewayRunManaged(HERMES_BIN, { profileDir })
+    const ready = await waitForGatewayRunning(profileDir)
+    if (!ready) throw new Error(`Gateway run fallback triggered but gateway did not report running within timeout${result.pid ? ` (PID: ${result.pid})` : ''}`)
+    return result.pid ? `Gateway run started (PID: ${result.pid})` : 'Gateway run started'
+  }
 }
 
 /**
@@ -293,7 +500,7 @@ export async function restartGateway(): Promise<string> {
 export async function stopGateway(): Promise<string> {
   const { stdout, stderr } = await execFileAsync(HERMES_BIN, ['gateway', 'stop'], {
     timeout: 30000,
-    ...execOpts,
+    ...activeGatewayExecOpts(),
   })
   return stdout || stderr
 }
@@ -363,7 +570,7 @@ export interface HermesProfile {
   name: string
   active: boolean
   model: string
-  gateway: string
+  gatewayStatus?: string
   alias: string
 }
 
@@ -372,48 +579,55 @@ export interface HermesProfileDetail {
   path: string
   model: string
   provider: string
-  gateway: string
   skills: number
   hasEnv: boolean
   hasSoulMd: boolean
+}
+
+function readProfileDefaultModel(name: string): string {
+  const configPath = join(getProfileDir(name), 'config.yaml')
+  if (!existsSync(configPath)) return '—'
+  try {
+    const config = YAML.load(readFileSync(configPath, 'utf-8'), { json: true }) as Record<string, any> | null
+    const model = config?.model
+    if (typeof model === 'string') return model.trim() || '—'
+    if (model && typeof model === 'object') {
+      return String(model.default || '').trim() || '—'
+    }
+  } catch (err) {
+    logger.warn(err, 'Hermes CLI: failed to read profile config model for %s', name)
+  }
+  return '—'
 }
 
 /**
  * List all profiles
  */
 export async function listProfiles(): Promise<HermesProfile[]> {
+  const profileNames = listProfileNamesFromDisk()
+  const activeProfileName = getActiveProfileName()
+  let runtimeInfo = new Map<string, ProfileListRuntimeInfo>()
   try {
     const { stdout } = await execFileAsync(HERMES_BIN, ['profile', 'list'], {
       timeout: 10000,
       ...execOpts,
     })
-
-    // Windows 可能使用 \r\n 换行符，统一处理
-    const normalized = stdout.replace(/\r\n/g, '\n').replace(/\r/g, '\n')
-    const lines = normalized.trim().split('\n').filter(Boolean)
-    const profiles: HermesProfile[] = []
-
-    // Skip header lines (starts with " Profile" or " ─")
-    for (const line of lines) {
-      if (line.startsWith(' Profile') || line.match(/^ ─/)) continue
-
-      const match = line.match(/^\s+(◆)?(.+?)\s+(\S+)\s{2,}(\S+)\s{2,}(.*)$/)
-      if (match) {
-        profiles.push({
-          name: match[2],
-          active: !!match[1],
-          model: match[3],
-          gateway: match[4],
-          alias: match[5].trim() === '—' ? '' : match[5].trim(),
-        })
-      }
-    }
-
-    return profiles
+    runtimeInfo = parseProfileListRuntimeInfo(stdout, profileNames)
   } catch (err: any) {
-    logger.error(err, 'Hermes CLI: profile list failed')
-    throw new Error(`Failed to list profiles: ${err.message}`)
+    logger.warn(err, 'Hermes CLI: profile list failed; falling back to disk profile list')
   }
+
+  return profileNames.map(name => {
+    const runtime = runtimeInfo.get(name)
+    const gatewayStatus = runtime?.gatewayStatus
+    return {
+      name,
+      active: runtime?.active ?? name === activeProfileName,
+      model: readProfileDefaultModel(name),
+      gatewayStatus: gatewayStatus && gatewayStatus !== '—' && gatewayStatus !== '-' ? gatewayStatus : undefined,
+      alias: runtime?.alias || '',
+    }
+  })
 }
 
 /**
@@ -428,7 +642,7 @@ export async function getProfile(name: string): Promise<HermesProfileDetail> {
 
     const result: Record<string, string> = {}
     for (const line of stdout.trim().split('\n')) {
-      const match = line.match(/^(\w[\w\s]*?):\s+(.+)$/)
+      const match = line.match(/^([^\s:]+):\s+(.+)$/)
       if (match) {
         result[match[1].trim().toLowerCase().replace(/\s+/g, '_')] = match[2].trim()
       }
@@ -443,10 +657,9 @@ export async function getProfile(name: string): Promise<HermesProfileDetail> {
       path: result.path || '',
       model,
       provider: providerMatch ? providerMatch[1] : '',
-      gateway: result.gateway || '',
       skills: parseInt(result.skills || '0', 10),
       hasEnv: result['.env'] === 'exists',
-      hasSoulMd: result.soul_md === 'exists',
+      hasSoulMd: result['soul.md'] === 'exists',
     }
   } catch (err: any) {
     if (err.code === 1 || err.status === 1) {

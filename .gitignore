@@ -9,11 +9,18 @@ lerna-debug.log*
 package-lock.json
 node_modules
 dist
+playwright-report
+test-results
 dist-ssr
+coverage
+__pycache__/
+*.py[cod]
 server/dist
 packages/server/dist
 *.local
 ROADMAP.md
+pnpm-lock.yaml
+pnpm-workspace.yaml
 # Server data
 packages/server/data/
 packages/server/node_modules/

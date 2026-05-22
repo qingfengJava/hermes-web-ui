@@ -31,6 +31,7 @@ export interface ModelVisibilityRule {
 }
 
 export type ModelVisibility = Record<string, ModelVisibilityRule>
+export type CustomModels = Record<string, string[]>
 
 export interface AvailableModelGroup {
   provider: string   // credential pool key (e.g. "zai", "custom:subrouter.ai")
@@ -45,14 +46,23 @@ export interface AvailableModelGroup {
   model_meta?: Record<string, { preview?: boolean; disabled?: boolean; alias?: string }>
 }
 
+export interface ProfileAvailableModels {
+  profile: string
+  default: string
+  default_provider: string
+  groups: AvailableModelGroup[]
+}
+
 export interface AvailableModelsResponse {
   default: string
   default_provider: string
   groups: AvailableModelGroup[]
   allProviders: AvailableModelGroup[]
+  profiles?: ProfileAvailableModels[]
   /** Web UI-only display aliases keyed by provider -> canonical model ID. */
   model_aliases?: Record<string, Record<string, string>>
   model_visibility?: ModelVisibility
+  custom_models?: CustomModels
 }
 
 export interface CustomProvider {
@@ -78,6 +88,23 @@ export async function fetchConfigModels(): Promise<ConfigModelsResponse> {
 
 export async function fetchAvailableModels(): Promise<AvailableModelsResponse> {
   return request<AvailableModelsResponse>('/api/hermes/available-models')
+}
+
+export async function fetchAvailableModelsForProfile(profile: string): Promise<AvailableModelsResponse> {
+  const params = new URLSearchParams()
+  params.set('profile', profile || 'default')
+  return request<AvailableModelsResponse>(`/api/hermes/available-models?${params.toString()}`)
+}
+
+export async function fetchProviderModels(data: {
+  base_url: string
+  api_key?: string
+  freeOnly?: boolean
+}): Promise<{ models: string[] }> {
+  return request<{ models: string[] }>('/api/hermes/provider-models', {
+    method: 'POST',
+    body: JSON.stringify(data),
+  })
 }
 
 export async function updateDefaultModel(data: {
@@ -136,5 +163,27 @@ export async function updateModelVisibility(data: {
   return request<{ success: boolean; model_visibility: ModelVisibility }>('/api/hermes/model-visibility', {
     method: 'PUT',
     body: JSON.stringify(data),
+  })
+}
+
+export async function addCustomModel(data: {
+  provider: string
+  model: string
+}): Promise<{ success: boolean; custom_models: CustomModels }> {
+  return request<{ success: boolean; custom_models: CustomModels }>('/api/hermes/custom-model', {
+    method: 'PUT',
+    body: JSON.stringify(data),
+  })
+}
+
+export async function removeCustomModel(data: {
+  provider: string
+  model: string
+}): Promise<{ success: boolean; custom_models: CustomModels }> {
+  const params = new URLSearchParams()
+  params.set('provider', data.provider)
+  params.set('model', data.model)
+  return request<{ success: boolean; custom_models: CustomModels }>(`/api/hermes/custom-model?${params.toString()}`, {
+    method: 'DELETE',
   })
 }
